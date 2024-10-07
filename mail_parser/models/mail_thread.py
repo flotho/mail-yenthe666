@@ -7,19 +7,21 @@ from odoo.tools import html2plaintext
 class MailThread(models.AbstractModel):
     _inherit = 'mail.thread'
 
-    def _mail_parser_custom(self, model, thread_id, custom_values, user_id, alias_id, message):
+    def _mail_parser_custom(self, model, thread_id, custom_values, user_id, alias_id, message_dict):
         """
         Prepare custom value from email
         """
+        original_custom_values = custom_values.copy()
+        message = message_dict.get('body')
         if alias_id and alias_id.mail_parser_ids:
             mail_parser_by_model = {}
             for models_id, grouped_lines in groupby(alias_id.mail_parser_ids, key=lambda l: l.models_id.id):
                 mail_parser_by_model[models_id] = self.env['mail.parser'].concat(*grouped_lines)
             if mail_parser_by_model:
-                linked_dict = {}
-                for model_id, parser_id in mail_parser_by_model.items():
-                    model_vals = {}
-                    domain_vals = {}
+                model_vals = {}
+                domain_vals = {}
+                
+                for model_id, parser_id in mail_parser_by_model.items():    
                     for parser in parser_id:
                         email_body = str(message)
                         tags_to_replace = ["<b>", "</b>"]
@@ -39,31 +41,23 @@ class MailThread(models.AbstractModel):
                             else:
                                 continue  # no default value set on this field
 
-                    if model_id:
-                        custom_model_id = False
-                        model_id_rec = self.env['ir.model'].browse(model_id)
-                        if model_id_rec and model_vals:
-                            model_obj = self.env[model_id_rec.model]
-                            domain = self._prepared_domain_from_dict(domain_vals)
-                            if domain:
-                                custom_model_id = model_obj.search(domain, limit=1)
-                            if not custom_model_id:
-                                custom_model_id = model_obj.create(model_vals)
-                            model_name = model_id_rec.model.replace('.', '_')
-                            linked_dict.update({
-                                model_name: custom_model_id.id,
-                                'alias_id': alias_id
-                            })
-                return linked_dict
+                if model_vals.get('email', False) and message_dict.get('email_from', False):
+                    message_dict.update({
+                        'email_from': model_vals.get('email', False)
+                    })
+                custom_values.update(model_vals)
+                return custom_values, message_dict, domain_vals
 
-    def _prepared_domain_from_dict(self, model_vals):
+
+    def _prepared_domain_from_dict(self, domain_vals):
         """
         Prepared domain from dictionary
         """
         domain = []
-        for key, value in model_vals.items():
+        for key, value in domain_vals.items():
             domain.append((key,'=', value))
         return domain
+
 
     @api.model
     def _message_route_process(self, message, message_dict, routes):
@@ -71,6 +65,9 @@ class MailThread(models.AbstractModel):
         Method overwrite from
         URL: https://github.com/odoo/odoo/blob/69b1993fb45b76110c24f5189a0ecfe9eb59a2aa/addons/mail/models/mail_thread.py#L1130
         """
+        if not message_dict['message_type'] == 'email':
+            return super()._message_route_process(message, message_dict, routes)
+        
         self = self.with_context(attachments_mime_plainxml=True)  # import XML attachments as text
         # postpone setting message_dict.partner_ids after message_post, to avoid double notifications
         original_partner_ids = message_dict.pop('partner_ids', [])
@@ -80,16 +77,30 @@ class MailThread(models.AbstractModel):
         for model, thread_id, custom_values, user_id, alias in routes or ():
             subtype_id = False
             related_user = self.env['res.users'].browse(user_id)
-            if alias.mail_parser_ids:
-                custom_parser_value = self._mail_parser_custom(model, thread_id, custom_values, user_id, alias,
-                                                               message_dict.get('body'))
-            Model = self.env[model].with_context(custom_parser_value=custom_parser_value, mail_create_nosubscribe=True,
-                                                 mail_create_nolog=True)
+            Model = self.env[model].with_context(mail_create_nosubscribe=True, mail_create_nolog=True)
             if not (thread_id and hasattr(Model, 'message_update') or hasattr(Model, 'message_new')):
                 raise ValueError(
                     "Undeliverable mail with Message-Id %s, model %s does not accept incoming emails" %
                     (message_dict['message_id'], model)
                 )
+                
+            if alias.mail_parser_ids:
+                custom_parser_value, custom_message_dict, domain_vals = self._mail_parser_custom(
+                                        model, 
+                                        thread_id, 
+                                        custom_values, 
+                                        user_id, alias,
+                                        message_dict)
+                custom_values = custom_parser_value
+                message_dict = custom_message_dict
+                domain = self._prepared_domain_from_dict(domain_vals)
+                existing_record_id = Model.search(domain, limit=1)
+                Model = Model.with_context(
+                            custom_parser_value=custom_parser_value,
+                            alias_id=alias,
+                            existing_record_id=existing_record_id)
+                if existing_record_id:
+                    thread_id = existing_record_id.id
 
             # disabled subscriptions during message_new/update to avoid having the system user running the
             # email gateway become a follower of all inbound messages
@@ -120,8 +131,7 @@ class MailThread(models.AbstractModel):
 
             post_params = dict(subtype_id=subtype_id, partner_ids=partner_ids, **message_dict)
             # remove computational values not stored on mail.message and avoid warnings when creating it
-            for x in ('from', 'to', 'cc', 'recipients', 'references', 'in_reply_to', 'bounced_email', 'bounced_message',
-                      'bounced_msg_id', 'bounced_partner'):
+            for x in ('from', 'to', 'cc', 'recipients', 'references', 'in_reply_to', 'bounced_email', 'bounced_message', 'bounced_msg_id', 'bounced_partner'):
                 post_params.pop(x, None)
             new_msg = False
             if thread._name == 'mail.thread':  # message with parent_id not linked to record
@@ -162,13 +172,11 @@ class MailThread(models.AbstractModel):
         Example Usage:{'res_partner': 56}
         """
         message_new = super().message_new(msg_dict, custom_values)
-        data = {}
         context = dict(self._context) or {}
+        
         if 'custom_parser_value' in context and context.get('custom_parser_value'):
-            data = {'active_model': message_new._name, 'active_id': message_new.id}
-            if isinstance(context.get('custom_parser_value'), dict):
-                data.update(context.get('custom_parser_value').copy())
-            action_server = data.get('alias_id').mail_parser_server_action_id
+            alias_id = context.get('alias_id')
+            action_server = alias_id.mail_parser_server_action_id
             if action_server:
                 action_server.sudo().with_context(data).run()
         return message_new
